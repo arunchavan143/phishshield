@@ -1,0 +1,7 @@
+streamlit
+requests
+tldextract
+python-whois
+dnspython
+plotly
+networkx
