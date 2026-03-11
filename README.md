@@ -39,7 +39,7 @@ The tool mimics workflows used by professional threat intelligence platforms and
 Clone repository:
 
 ```
-git clone https://github.com/YOUR_USERNAME/phishshield.git
+git clone https://github.com/arunchavan143/phishshield.git
 cd phishshield
 ```
 
