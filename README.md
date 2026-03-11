@@ -39,8 +39,8 @@ The tool mimics workflows used by professional threat intelligence platforms and
 Clone repository:
 
 ```
-git clone https://github.com/arunchavan143/phishshield.git
-cd phishshield
+https://github.com/arunchavan143/phishshield-url-forensic-dashboard
+cd phishshield-url-forensic-dashboard
 ```
 
 Install dependencies:
