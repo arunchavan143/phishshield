@@ -39,8 +39,10 @@ The tool mimics workflows used by professional threat intelligence platforms and
 Clone repository:
 
 ```
-https://github.com/arunchavan143/phishshield
+git clone https://github.com/arunchavan143/phishshield
 cd phishshield
+pip install -r requirements.txt
+python app.py
 ```
 
 Install dependencies:
