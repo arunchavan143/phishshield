@@ -8,7 +8,7 @@ The tool mimics workflows used by professional threat intelligence platforms and
 
 ## Features
 
-* URL risk scoring engine
+* URL risk scoring engine.
 * Visual **risk gauge meter**
 * **Redirect chain graph analysis**
 * Domain intelligence (IP, ASN, geolocation)
