@@ -99,6 +99,3 @@ Indicators detected:
 
 ---
 
-## License
-
-MIT License
