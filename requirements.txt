@@ -2,3 +2,4 @@ streamlit>=1.45
 requests>=2.32.3
 tldextract>=5.3.0
 plotly>=6.0
+pandas>=2.2
