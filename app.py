@@ -1,227 +1,209 @@
-import streamlit as st
+"""Streamlit interface for PhishShield."""
+
+from __future__ import annotations
+
+import json
+
 import plotly.graph_objects as go
-import networkx as nx
+import streamlit as st
 
 from engine import URLAnalyzer
-from intelligence import resolve_ip,ip_info
+from intelligence import ip_info, resolve_ip
+from risk import RISK_COLORS, calculate_risk
 
 
 st.set_page_config(
-    page_title="PhishShield SOC",
+    page_title="PhishShield | URL Investigation",
     page_icon="🛡️",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-st.markdown("""
-<style>
-
-.stApp {
-background: linear-gradient(180deg,#0a0f1a,#05070d);
-color:white;
-}
-
-h1,h2,h3 {
-color:#00c8ff;
-}
-
-.block-container{
-padding-top:2rem;
-}
-
-</style>
-""",unsafe_allow_html=True)
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background: radial-gradient(circle at top right, #11263c 0%, #07101b 38%, #05080d 100%);
+    }
+    .block-container { padding-top: 2rem; padding-bottom: 3rem; }
+    [data-testid="stMetricValue"] { color: #5ee7ff; }
+    h1, h2, h3 { letter-spacing: -0.02em; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
-st.title("🛡️ PhishShield — URL Forensic Investigation Dashboard")
 
-url = st.text_input("Enter URL to Investigate")
+def risk_gauge(score: int, verdict: str) -> go.Figure:
+    """Build the risk gauge visualization."""
 
-
-def calculate_risk(meta):
-
-    score = 0
-    indicators = []
-
-    if meta["entropy"] > 3.5:
-        score += 20
-        indicators.append("High domain entropy")
-
-    if meta["has_ip"]:
-        score += 30
-        indicators.append("IP used in URL")
-
-    if meta["has_keywords"]:
-        score += 10
-        indicators.append("Suspicious keyword")
-
-    if len(meta["redirect_chain"]) > 2:
-        score += 20
-        indicators.append("Multiple redirects")
-
-    if score >= 60:
-        verdict = "HIGH RISK"
-    elif score >= 30:
-        verdict = "SUSPICIOUS"
-    else:
-        verdict = "SAFE"
-
-    return verdict,score,indicators
+    color = RISK_COLORS[verdict]
+    return go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=score,
+            number={"suffix": "/100"},
+            title={"text": verdict},
+            gauge={
+                "axis": {"range": [0, 100]},
+                "bar": {"color": color},
+                "steps": [
+                    {"range": [0, 30], "color": "#153d2a"},
+                    {"range": [30, 60], "color": "#4a3712"},
+                    {"range": [60, 100], "color": "#4a1f24"},
+                ],
+            },
+        )
+    ).update_layout(height=300, margin={"l": 20, "r": 20, "t": 50, "b": 20})
 
 
-def risk_gauge(score):
-
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=score,
-        title={"text":"Risk Score"},
-        gauge={
-            "axis":{"range":[0,100]},
-            "steps":[
-                {"range":[0,30],"color":"green"},
-                {"range":[30,60],"color":"yellow"},
-                {"range":[60,100],"color":"red"}
-            ]
-        }
-    ))
-
-    return fig
-
-
-def redirect_graph(chain):
+def redirect_graph(chain: tuple[str, ...]) -> go.Figure | None:
+    """Render a deterministic redirect graph when redirects are present."""
 
     if len(chain) < 2:
         return None
 
-    G = nx.DiGraph()
+    x_values = list(range(len(chain)))
+    y_values = [0] * len(chain)
+    edge_x: list[float | None] = []
+    edge_y: list[float | None] = []
+    for index in range(len(chain) - 1):
+        edge_x.extend([x_values[index], x_values[index + 1], None])
+        edge_y.extend([0, 0, None])
 
-    for i in range(len(chain)-1):
-        G.add_edge(chain[i],chain[i+1])
-
-    pos = nx.spring_layout(G)
-
-    edge_x=[]
-    edge_y=[]
-
-    for edge in G.edges():
-        x0,y0 = pos[edge[0]]
-        x1,y1 = pos[edge[1]]
-
-        edge_x += [x0,x1,None]
-        edge_y += [y0,y1,None]
-
-    edge_trace = go.Scatter(
-        x=edge_x,
-        y=edge_y,
-        line=dict(width=2,color="#888"),
-        hoverinfo="none",
-        mode="lines"
+    figure = go.Figure(
+        data=[
+            go.Scatter(
+                x=edge_x,
+                y=edge_y,
+                mode="lines",
+                line={"width": 2, "color": "#64748b"},
+                hoverinfo="none",
+            ),
+            go.Scatter(
+                x=x_values,
+                y=y_values,
+                mode="markers+text",
+                text=[f"Step {index + 1}" for index in range(len(chain))],
+                customdata=list(chain),
+                hovertemplate="%{customdata}<extra></extra>",
+                textposition="top center",
+                marker={"size": 16, "color": "#5ee7ff"},
+            ),
+        ]
     )
-
-    node_x=[]
-    node_y=[]
-    text=[]
-
-    for node in G.nodes():
-
-        x,y = pos[node]
-
-        node_x.append(x)
-        node_y.append(y)
-        text.append(node)
-
-    node_trace = go.Scatter(
-        x=node_x,
-        y=node_y,
-        text=text,
-        mode="markers+text",
-        textposition="top center",
-        marker=dict(size=14,color="cyan")
-    )
-
-    fig = go.Figure(data=[edge_trace,node_trace])
-
-    fig.update_layout(
+    figure.update_layout(
+        height=280,
         showlegend=False,
-        margin=dict(l=20,r=20,t=20,b=20),
-        plot_bgcolor="#0e1117"
+        xaxis={"visible": False},
+        yaxis={"visible": False},
+        plot_bgcolor="#0b1420",
+        paper_bgcolor="rgba(0,0,0,0)",
+        margin={"l": 20, "r": 20, "t": 40, "b": 20},
+    )
+    return figure
+
+
+def render_domain_intelligence(metadata: dict) -> None:
+    """Render DNS and IP enrichment information."""
+
+    ip_address = resolve_ip(metadata["domain"])
+    if not ip_address:
+        st.warning("Unable to resolve an IPv4 address for this hostname.")
+        return
+
+    enrichment = ip_info(ip_address)
+    if not enrichment:
+        st.info(f"Resolved IP address: `{ip_address}`. Public enrichment was unavailable.")
+        return
+
+    first, second, third = st.columns(3)
+    first.metric("IP address", enrichment["ip"])
+    second.metric("Organization", enrichment["org"])
+    third.metric("Country", enrichment["country"])
+    st.caption(f"Location: {enrichment['city']} · Coordinates: {enrichment['loc']}")
+
+
+st.title("PhishShield")
+st.caption("A focused SOC-style workspace for investigating suspicious URLs.")
+
+with st.sidebar:
+    st.header("Investigation guide")
+    st.write("PhishShield combines URL structure indicators with bounded redirect and domain lookups.")
+    st.info("A low-risk score is not proof that a site is safe. Use this dashboard as an investigation aid.")
+    st.divider()
+    st.caption("Network lookups use short timeouts and never download page bodies.")
+
+with st.form("investigation_form"):
+    url = st.text_input(
+        "URL to investigate",
+        placeholder="https://example.com/login",
+        help="Enter an http:// or https:// URL. If omitted, https:// is assumed.",
+    )
+    submitted = st.form_submit_button("Start investigation", type="primary", use_container_width=True)
+
+if submitted:
+    try:
+        with st.spinner("Inspecting URL structure and redirect behavior…"):
+            metadata = URLAnalyzer(url).metadata()
+        verdict, score, indicators = calculate_risk(metadata)
+    except ValueError as exc:
+        st.error(str(exc))
+        st.stop()
+
+    st.divider()
+    overview, signals, redirects, intelligence, raw = st.tabs(
+        ["Overview", "URL signals", "Redirect path", "Domain intelligence", "Raw data"]
     )
 
-    return fig
+    with overview:
+        left, right = st.columns([1.15, 1])
+        with left:
+            st.plotly_chart(risk_gauge(score, verdict), use_container_width=True, config={"displayModeBar": False})
+        with right:
+            st.subheader("Investigation summary")
+            st.metric("Hostname", metadata["domain"])
+            st.metric("Final URL", metadata["final_url"])
+            if metadata["network_error"]:
+                st.warning(f"Network lookup note: {metadata['network_error']}")
+            if indicators:
+                st.write("**Indicators contributing to the score**")
+                for indicator in indicators:
+                    st.write(f"- {indicator}")
+            else:
+                st.success("No configured risk indicators were triggered.")
 
+    with signals:
+        first, second, third = st.columns(3)
+        first.metric("Hostname entropy", metadata["entropy"])
+        second.metric("IP in hostname", "Yes" if metadata["has_ip"] else "No")
+        third.metric("Keyword matches", len(metadata["matched_keywords"]))
+        st.write("**Registered domain:**", metadata["registered_domain"])
+        if metadata["matched_keywords"]:
+            st.write("**Matched keywords:**", ", ".join(metadata["matched_keywords"]))
 
-if st.button("Start Investigation"):
-
-    analyzer = URLAnalyzer(url)
-
-    meta = analyzer.metadata()
-
-    verdict,score,indicators = calculate_risk(meta)
-
-    tab1,tab2,tab3,tab4 = st.tabs([
-        "Overview",
-        "Redirect Analysis",
-        "Domain Intelligence",
-        "Raw Data"
-    ])
-
-    with tab1:
-
-        st.subheader("Verdict")
-
-        if verdict == "SAFE":
-            st.success(verdict)
-        elif verdict == "SUSPICIOUS":
-            st.warning(verdict)
+    with redirects:
+        st.metric("Redirects followed", metadata["redirect_count"])
+        graph = redirect_graph(tuple(metadata["redirect_chain"]))
+        if graph:
+            st.plotly_chart(graph, use_container_width=True, config={"displayModeBar": False})
+            st.dataframe(
+                {"Step": list(range(1, len(metadata["redirect_chain"]) + 1)), "URL": list(metadata["redirect_chain"])},
+                hide_index=True,
+                use_container_width=True,
+            )
         else:
-            st.error(verdict)
+            st.info("No redirects were detected.")
 
-        col1,col2 = st.columns(2)
+    with intelligence:
+        render_domain_intelligence(metadata)
 
-        with col1:
-            st.plotly_chart(risk_gauge(score),use_container_width=True)
-
-        with col2:
-
-            st.write("Indicators")
-
-            for i in indicators:
-                st.write("•",i)
-
-    with tab2:
-
-        st.subheader("Redirect Infrastructure")
-
-        fig = redirect_graph(meta["redirect_chain"])
-
-        if fig:
-            st.plotly_chart(fig,use_container_width=True)
-        else:
-            st.info("No redirects detected")
-
-    with tab3:
-
-        st.subheader("Domain Intelligence")
-
-        ip = resolve_ip(meta["domain"])
-
-        if ip:
-
-            info = ip_info(ip)
-
-            col1,col2,col3 = st.columns(3)
-
-            col1.metric("IP Address",ip)
-
-            if info:
-                col2.metric("ASN / Org",info["org"])
-                col3.metric("Country",info["country"])
-
-        else:
-
-            st.warning("Unable to resolve IP")
-
-    with tab4:
-
-        st.subheader("Raw Metadata")
-
-        st.json(meta)
+    with raw:
+        st.json(metadata)
+        st.download_button(
+            "Download JSON report",
+            data=json.dumps(metadata, indent=2),
+            file_name="phishshield-report.json",
+            mime="application/json",
+        )
