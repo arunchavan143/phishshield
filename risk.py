@@ -33,13 +33,12 @@ def classify_score(score: int) -> str:
 def score_evidence(evidence: Iterable[object]) -> tuple[str, int]:
     """Aggregate scored evidence into a verdict and capped risk score."""
 
-    total = 0
-    for item in evidence:
-        if isinstance(item, dict):
-            total += int(item.get("score", 0))
-        else:
-            total += int(getattr(item, "score", 0))
-    score = min(total, 100)
+    contributions: dict[str, int] = {}
+    for index, item in enumerate(evidence):
+        values = item if isinstance(item, dict) else vars(item)
+        key = values.get("rule_id") or f"legacy-{index}"
+        contributions[key] = max(contributions.get(key, 0), max(0, int(values.get("score", 0))))
+    score = min(sum(contributions.values()), 100)
     return classify_score(score), score
 
 

@@ -24,3 +24,23 @@ def test_reputation_match_returns_provenance_rich_evidence():
     assert result.threat_types == ("SOCIAL_ENGINEERING",)
     assert result.evidence[0]["rule_id"] == "REPUTATION_MATCH"
     post.assert_called_once()
+
+
+def test_provider_error_does_not_export_api_key_or_url():
+    import requests
+    secret = 'unit-test-secret-value'
+    with patch.dict('os.environ', {'PHISHSHIELD_SAFE_BROWSING_KEY': secret}), patch(
+        'reputation.requests.post', side_effect=requests.HTTPError('https://provider.invalid?key=' + secret)
+    ):
+        result = check_safe_browsing('https://example.com?token=private')
+    assert result.status == 'error'
+    assert secret not in str(result.as_dict())
+    assert 'private' not in str(result.as_dict())
+
+
+def test_malformed_provider_schema_cannot_look_clean():
+    response = Mock(status_code=200)
+    response.json.return_value = {'matches': None}
+    with patch.dict('os.environ', {'PHISHSHIELD_SAFE_BROWSING_KEY': 'test-key'}), patch('reputation.requests.post', return_value=response):
+        result = check_safe_browsing('https://example.com')
+    assert result.status == 'error'

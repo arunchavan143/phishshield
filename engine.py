@@ -5,14 +5,15 @@ from __future__ import annotations
 import ipaddress
 import math
 import re
-import socket
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from time import perf_counter
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, urljoin, urlsplit
 
-import requests
-import tldextract
+from uuid import uuid4
+
+from networking import CollectionError, Deadline, DeadlineExceeded, DestinationBlocked, request_headers, resolve_public
+from url_utils import EXTRACT, normalize_url
 
 from reputation import check_reputation
 from risk import score_evidence
@@ -71,6 +72,9 @@ BRAND_DOMAINS = {
     "paypal.com": "PayPal",
     "chase.com": "Chase",
 }
+ENGINE_VERSION = "3.1.0"
+RULESET_VERSION = "2026.11.1"
+
 BRAND_TERMS = tuple(domain.split(".")[0] for domain in BRAND_DOMAINS)
 
 
@@ -87,6 +91,7 @@ class Evidence:
     confidence: int
     source: str
     status: str = "observed"
+    subject_url: str | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -107,44 +112,28 @@ class URLAnalyzer:
         max_redirects: int = 10,
         follow_redirects: bool = True,
         enable_reputation: bool = False,
+        static_only: bool = False,
+        total_timeout: float = 30.0,
     ) -> None:
         self.url = self.normalize_url(raw_url)
+        if not 0.1 <= timeout <= 30 or not 0.1 <= total_timeout <= 120:
+            raise ValueError("Collection timeouts must be positive and within policy limits.")
+        if not 0 <= max_redirects <= 20:
+            raise ValueError("Maximum redirects must be between 0 and 20.")
         self.timeout = timeout
+        self.total_timeout = total_timeout
+        self.static_only = static_only
         self.max_redirects = max_redirects
-        self.follow_redirects = follow_redirects
-        self.enable_reputation = enable_reputation
+        self.follow_redirects = follow_redirects and not static_only
+        self.enable_reputation = enable_reputation and not static_only
         self.parsed = urlsplit(self.url)
         self.domain = self.parsed.hostname or ""
         self.host_ascii = self.domain.encode("idna").decode("ascii")
-        extracted = tldextract.extract(self.host_ascii)
+        extracted = EXTRACT(self.host_ascii)
         self.registered_domain = extracted.top_domain_under_public_suffix or self.host_ascii
         self.tld = extracted.suffix.lower()
 
-    @staticmethod
-    def normalize_url(raw_url: str) -> str:
-        """Normalize and validate an HTTP(S) URL before any network access."""
-
-        candidate = (raw_url or "").strip()
-        if not candidate:
-            raise ValueError("Enter a URL to investigate.")
-
-        existing_scheme = urlsplit(candidate).scheme.lower()
-        if existing_scheme and existing_scheme not in URL_SCHEMES:
-            raise ValueError("Only http:// and https:// URLs are supported.")
-        if "://" not in candidate:
-            candidate = f"https://{candidate}"
-
-        parsed = urlsplit(candidate)
-        if parsed.scheme.lower() not in URL_SCHEMES:
-            raise ValueError("Only http:// and https:// URLs are supported.")
-        if not parsed.hostname:
-            raise ValueError("The URL must include a valid hostname.")
-        if parsed.username or parsed.password:
-            raise ValueError("URLs containing embedded usernames or passwords are not supported.")
-        if parsed.port is not None and not 1 <= parsed.port <= 65535:
-            raise ValueError("The URL contains an invalid port.")
-
-        return candidate
+    normalize_url = staticmethod(normalize_url)
 
     @staticmethod
     def domain_entropy(domain: str) -> float:
@@ -196,7 +185,7 @@ class URLAnalyzer:
 
         labels = [label.lower() for label in self.host_ascii.split(".")]
         for brand in BRAND_TERMS:
-            if any(brand in label and label != brand for label in labels):
+            if any(brand in label for label in labels):
                 brand_name = next(name for domain, name in BRAND_DOMAINS.items() if domain.startswith(f"{brand}."))
                 return Evidence(
                     category="identity",
@@ -226,8 +215,6 @@ class URLAnalyzer:
 
     def _static_evidence(self) -> tuple[list[Evidence], dict]:
         evidence: list[Evidence] = []
-        labels = self.host_ascii.split(".")
-        path_and_query = f"{self.parsed.path}?{self.parsed.query}".lower()
         matches = self._keyword_matches()
         entropy = self.domain_entropy(self.host_ascii)
         suspicious_query_keys = {
@@ -272,17 +259,6 @@ class URLAnalyzer:
                 confidence=99,
                 source="IDNA parser",
             )
-        if any(ord(char) > 127 for char in self.domain):
-            add(
-                category="identity",
-                rule_id="UNICODE_HOST",
-                title="Unicode hostname",
-                detail="The hostname contains non-ASCII characters and may visually resemble a trusted domain.",
-                severity="high",
-                score=22,
-                confidence=98,
-                source="URL parser",
-            )
         if self.tld in SUSPICIOUS_TLDS:
             add(
                 category="identity",
@@ -294,12 +270,13 @@ class URLAnalyzer:
                 confidence=45,
                 source="local policy",
             )
-        if len(labels) >= 5:
+        subdomains = EXTRACT(self.host_ascii).subdomain.split(".") if EXTRACT(self.host_ascii).subdomain else []
+        if len(subdomains) >= 3:
             add(
                 category="identity",
                 rule_id="DEEP_SUBDOMAIN_CHAIN",
                 title="Deep subdomain chain",
-                detail=f"The hostname contains {len(labels) - 1} subdomain labels.",
+                detail=f"The hostname contains {len(subdomains)} subdomain labels.",
                 severity="medium",
                 score=8,
                 confidence=65,
@@ -395,7 +372,7 @@ class URLAnalyzer:
             "entropy": entropy,
             "has_ip": self.ip_in_url(),
             "matched_keywords": list(matches),
-            "subdomain_count": max(len(labels) - 2, 0),
+            "subdomain_count": len(subdomains),
             "scheme": self.parsed.scheme.lower(),
             "port": self.parsed.port,
             "path_length": len(self.parsed.path),
@@ -403,134 +380,102 @@ class URLAnalyzer:
         }
         return evidence, metadata
 
-    def _network_evidence(self) -> tuple[list[Evidence], dict]:
+    def _network_evidence(self, deadline: Deadline | None = None, dns: dict | None = None) -> tuple[list[Evidence], dict]:
         evidence: list[Evidence] = []
+        network = {
+            "status": "disabled", "redirect_chain": [self.url], "redirect_count": 0,
+            "final_url": None, "status_code": None, "response_time_ms": None,
+            "error": None, "hops": [], "blocked_url": None,
+        }
         if not self.follow_redirects:
-            return [], {"status": "disabled", "redirect_chain": [self.url], "redirect_count": 0}
-
+            return evidence, network
+        deadline = deadline or Deadline(self.total_timeout)
         started = perf_counter()
+        current = self.url
+        cache = {self.domain: dns["addresses"]} if dns and dns["status"] == "complete" else {}
         try:
-            with requests.Session() as session:
-                session.max_redirects = self.max_redirects
-                response = session.get(
-                    self.url,
-                    allow_redirects=True,
-                    timeout=self.timeout,
-                    headers={"User-Agent": "PhishShield/3.0 security research"},
-                    stream=True,
-                )
-                chain = tuple([history.url for history in response.history] + [response.url])
-                final_url = response.url
-                status_code = response.status_code
-                response.close()
-            elapsed_ms = round((perf_counter() - started) * 1000)
-            redirect_count = max(len(chain) - 1, 0)
-            if redirect_count >= 2:
-                evidence.append(
-                    Evidence(
-                        category="network",
-                        rule_id="MULTIPLE_REDIRECTS",
-                        title="Multiple redirects observed",
-                        detail=f"The URL followed {redirect_count} redirects before reaching the final response.",
-                        severity="medium",
-                        score=min(18, 8 + redirect_count * 2),
-                        confidence=92,
-                        source="HTTP redirect history",
-                    )
-                )
-            if status_code >= 400:
-                evidence.append(
-                    Evidence(
-                        category="network",
-                        rule_id="HTTP_ERROR_STATUS",
-                        title=f"Final response returned HTTP {status_code}",
-                        detail="The final HTTP response indicates an error or unavailable resource.",
-                        severity="low",
-                        score=5,
-                        confidence=99,
-                        source="HTTP response",
-                    )
-                )
-            final_domain = urlsplit(final_url).hostname or ""
-            final_registered = tldextract.extract(final_domain).top_domain_under_public_suffix or final_domain
-            if final_registered and final_registered != self.registered_domain:
-                evidence.append(
-                    Evidence(
-                        category="network",
-                        rule_id="CROSS_DOMAIN_REDIRECT",
-                        title="Redirect crossed registered domains",
-                        detail=f"The final destination is {final_registered}, different from {self.registered_domain}.",
-                        severity="high",
-                        score=20,
-                        confidence=95,
-                        source="HTTP redirect history",
-                    )
-                )
-            return evidence, {
-                "status": "complete",
-                "redirect_chain": list(chain),
-                "redirect_count": redirect_count,
-                "final_url": final_url,
-                "status_code": status_code,
-                "response_time_ms": elapsed_ms,
-                "error": None,
-            }
-        except requests.TooManyRedirects:
-            return [
-                Evidence(
-                    category="network",
-                    rule_id="REDIRECT_LIMIT_EXCEEDED",
-                    title="Redirect limit exceeded",
-                    detail=f"The URL exceeded the configured limit of {self.max_redirects} redirects.",
-                    severity="high",
-                    score=18,
-                    confidence=98,
-                    source="HTTP client",
-                )
-            ], {
-                "status": "failed",
-                "redirect_chain": [self.url],
-                "redirect_count": self.max_redirects,
-                "final_url": self.url,
-                "status_code": None,
-                "response_time_ms": round((perf_counter() - started) * 1000),
-                "error": "Redirect limit exceeded.",
-            }
-        except requests.RequestException as exc:
-            return [
-                Evidence(
-                    category="network",
-                    rule_id="NETWORK_LOOKUP_FAILED",
-                    title="Network lookup failed",
-                    detail=str(exc),
-                    severity="info",
-                    score=0,
-                    confidence=100,
-                    source="HTTP client",
-                    status="unavailable",
-                )
-            ], {
-                "status": "failed",
-                "redirect_chain": [self.url],
-                "redirect_count": 0,
-                "final_url": self.url,
-                "status_code": None,
-                "response_time_ms": round((perf_counter() - started) * 1000),
-                "error": str(exc),
-            }
+            if dns and dns["status"] != "complete":
+                error_type = DestinationBlocked if dns["status"] == "blocked" else CollectionError
+                raise error_type(dns["error"] or "DNS collection did not complete.")
+            visited: set[str] = set()
+            while True:
+                deadline.remaining()
+                if current in visited:
+                    raise CollectionError("Redirect loop detected.")
+                visited.add(current)
+                host = urlsplit(current).hostname or ""
+                if host not in cache:
+                    cache[host] = resolve_public(host, deadline, self.timeout)
+                response = request_headers(current, cache[host][0], deadline, self.timeout)
+                network["hops"].append({
+                    "url": current, "status_code": response.status_code,
+                    "address": response.address, "location": response.location,
+                })
+                network["final_url"] = current
+                network["status_code"] = response.status_code
+                if response.status_code not in {301, 302, 303, 307, 308} or not response.location:
+                    network["status"] = "complete"
+                    break
+                if network["redirect_count"] >= self.max_redirects:
+                    evidence.append(Evidence(
+                        "network", "REDIRECT_LIMIT_EXCEEDED", "Redirect limit exceeded",
+                        f"Stopped after {self.max_redirects} redirects.", "high", 18, 98, "HTTP client",
+                    ))
+                    raise CollectionError("Redirect limit exceeded.")
+                try:
+                    next_url = normalize_url(urljoin(current, response.location))
+                except ValueError:
+                    raise DestinationBlocked("Redirect contains a URL outside collection policy.") from None
+                network["redirect_chain"].append(next_url)
+                network["redirect_count"] += 1
+                current = next_url
+        except DestinationBlocked as exc:
+            network.update(status="blocked", error=str(exc), blocked_url=current)
+            evidence.append(Evidence(
+                "network", "DESTINATION_BLOCKED", "Destination blocked by collection policy",
+                str(exc), "info", 0, 100, "outbound policy", "blocked", current,
+            ))
+        except CollectionError as exc:
+            network.update(status="failed", error=str(exc))
+            evidence.append(Evidence(
+                "network", "NETWORK_LOOKUP_FAILED", "Network collection incomplete",
+                str(exc), "info", 0, 100, "HTTP client", "unavailable", current,
+            ))
+        network["response_time_ms"] = round((perf_counter() - started) * 1000)
+        if network["redirect_count"] >= 2:
+            evidence.append(Evidence(
+                "network", "MULTIPLE_REDIRECTS", "Multiple redirects observed",
+                f"Observed {network['redirect_count']} redirect destinations.", "medium",
+                min(18, 8 + network["redirect_count"] * 2), 92, "HTTP redirect headers",
+            ))
+        if network["status_code"] and network["status_code"] >= 400:
+            evidence.append(Evidence(
+                "network", "HTTP_ERROR_STATUS", "HTTP error response",
+                f"Last fetched destination returned HTTP {network['status_code']}.",
+                "low", 5, 99, "HTTP response",
+            ))
+        for destination in network["redirect_chain"][1:]:
+            host = urlsplit(destination).hostname or ""
+            registered = EXTRACT(host).top_domain_under_public_suffix or host
+            if registered != self.registered_domain:
+                evidence.append(Evidence(
+                    "network", "CROSS_DOMAIN_REDIRECT", "Redirect crossed registered domains",
+                    f"Redirect destination belongs to {registered}.", "high", 20, 95,
+                    "HTTP redirect headers", subject_url=destination,
+                ))
+        return evidence, network
 
-    def _dns_data(self) -> dict:
+    def _dns_data(self, deadline: Deadline) -> dict:
+        if self.static_only:
+            return {"status": "disabled", "addresses": [], "error": None}
         try:
-            addresses = sorted(
-                {
-                    result[4][0]
-                    for result in socket.getaddrinfo(self.domain, None, type=socket.SOCK_STREAM)
-                    if result[4]
-                }
-            )
+            addresses = resolve_public(self.domain, deadline, self.timeout)
             return {"status": "complete", "addresses": addresses, "error": None}
-        except (socket.gaierror, OSError) as exc:
-            return {"status": "failed", "addresses": [], "error": str(exc)}
+        except CollectionError as exc:
+            return {
+                "status": "blocked" if isinstance(exc, DestinationBlocked) else "failed",
+                "addresses": [], "error": str(exc),
+            }
 
     @staticmethod
     def _recommendations(evidence: list[Evidence], network: dict, reputation_status: str) -> list[str]:
@@ -543,6 +488,8 @@ class URLAnalyzer:
             recommendations.append("Verify the claimed brand using a known-good bookmark or independently sourced contact method.")
         if "NETWORK_LOOKUP_FAILED" in {item.rule_id for item in evidence}:
             recommendations.append("Repeat network collection only in an isolated analysis environment; the network evidence is incomplete.")
+        if network["status"] == "blocked":
+            recommendations.append("Collection policy blocked a destination. Review the observed chain; a policy block alone does not establish phishing.")
         if reputation_status in {"disabled", "not_configured", "error"}:
             recommendations.append("Configure an approved reputation provider if organizational policy permits sending URLs to third parties.")
         if not recommendations:
@@ -550,53 +497,60 @@ class URLAnalyzer:
         return recommendations
 
     def analyze(self) -> dict:
-        """Return a complete explainable investigation report."""
-
+        """Return a versioned report; coverage is not a detection probability."""
+        deadline = Deadline(self.total_timeout)
         static_evidence, metadata = self._static_evidence()
-        network_evidence, network = self._network_evidence()
-        evidence = static_evidence + network_evidence
-        dns = self._dns_data()
-        reputation = (
-            check_reputation(self.url, timeout=self.timeout)
-            if self.enable_reputation
-            else {
-                "status": "disabled",
-                "provider": "Google Safe Browsing",
-                "checked_at": datetime.now(UTC).isoformat(),
-                "threat_types": [],
-                "detail": "Reputation lookup was not enabled for this investigation.",
-                "error": None,
-                "evidence": [],
-            }
-        )
+        evidence = [replace(item, subject_url=self.url) for item in static_evidence]
+        dns = self._dns_data(deadline)
+        network_evidence, network = self._network_evidence(deadline, dns)
+        evidence.extend(network_evidence)
+        # Analyze observed redirect targets even if outbound policy blocks a fetch.
+        for destination in dict.fromkeys(network["redirect_chain"][1:]):
+            destination_analyzer = URLAnalyzer(destination, static_only=True)
+            hop_evidence, _ = destination_analyzer._static_evidence()
+            evidence.extend(replace(item, subject_url=destination) for item in hop_evidence)
+        reputation = {
+            "status": "disabled", "provider": "Google Safe Browsing",
+            "checked_at": None, "threat_types": [], "evidence": [],
+            "detail": "Reputation lookup was not enabled.", "error": None,
+            "checked_urls": [],
+        }
+        if self.enable_reputation:
+            try:
+                reputation = check_reputation(self.url, timeout=min(self.timeout, deadline.remaining()))
+                reputation["checked_urls"] = [self.url]
+            except DeadlineExceeded:
+                reputation.update(status="error", error="Investigation budget exhausted before reputation lookup.")
         evidence.extend(Evidence(**item) for item in reputation.get("evidence", []))
         verdict, risk_score = score_evidence(evidence)
-
-        attempted_checks = 3  # static analysis, network collection, and DNS collection
-        completed_checks = 1 + (network["status"] == "complete") + (dns["status"] == "complete")
-        if reputation["status"] not in {"disabled", "not_configured"}:
-            attempted_checks += 1
-            completed_checks += reputation["status"] in {"clean", "match"}
-        confidence = round((completed_checks / attempted_checks) * 100)
-        reputation_status = reputation["status"]
+        checks = {
+            "static": "complete", "dns": dns["status"],
+            "http": network["status"], "reputation": reputation["status"],
+        }
+        attempted = sum(status != "disabled" for status in checks.values())
+        completed = sum(status in {"complete", "clean", "match"} for status in checks.values())
+        percent = round(100 * completed / attempted)
         return {
-            "schema_version": "3.0",
+            "schema_version": "3.1", "engine_version": ENGINE_VERSION,
+            "ruleset_version": RULESET_VERSION, "case_id": str(uuid4()),
             "generated_at": datetime.now(UTC).isoformat(),
-            "subject": metadata,
-            "verdict": verdict,
-            "risk_score": risk_score,
-            "confidence": confidence,
+            "settings": {
+                "timeout_seconds": self.timeout, "total_timeout_seconds": self.total_timeout,
+                "max_redirects": self.max_redirects, "follow_redirects": self.follow_redirects,
+                "enable_reputation": self.enable_reputation, "static_only": self.static_only,
+                "allowed_ports": [80, 443], "scoring": "maximum contribution per rule across destinations",
+            },
+            "subject": metadata, "verdict": verdict, "risk_score": risk_score,
+            "confidence": percent,  # Deprecated 3.0 alias for collection coverage only.
+            "detection_confidence": None,
             "coverage": {
-                "status": "partial" if confidence < 80 else "complete",
-                "completed_checks": completed_checks,
-                "attempted_checks": attempted_checks,
-                "reputation": reputation_status,
+                "status": "complete" if completed == attempted else "partial",
+                "percent": percent, "completed_checks": completed,
+                "attempted_checks": attempted, "checks": checks, "reputation": reputation["status"],
             },
             "evidence": [item.as_dict() for item in evidence],
-            "network": network,
-            "dns": dns,
-            "reputation": reputation,
-            "recommendations": self._recommendations(evidence, network, reputation_status),
+            "network": network, "dns": dns, "reputation": reputation,
+            "recommendations": self._recommendations(evidence, network, reputation["status"]),
         }
 
     def metadata(self) -> dict:

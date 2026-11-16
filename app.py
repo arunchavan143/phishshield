@@ -10,7 +10,8 @@ import streamlit as st
 
 from engine import URLAnalyzer
 from intelligence import ip_info
-from risk import RISK_COLORS, confidence_label, severity_color
+from risk import RISK_COLORS
+from url_utils import defang_url, redact_report
 
 
 st.set_page_config(
@@ -36,7 +37,7 @@ st.markdown(
 
 
 def risk_gauge(score: int, verdict: str, confidence: int) -> go.Figure:
-    """Build a severity and confidence-aware gauge."""
+    """Build a severity and coverage-aware gauge."""
 
     color = RISK_COLORS.get(verdict, RISK_COLORS["LOW"])
     figure = go.Figure(
@@ -44,7 +45,7 @@ def risk_gauge(score: int, verdict: str, confidence: int) -> go.Figure:
             mode="gauge+number",
             value=score,
             number={"suffix": "/100"},
-            title={"text": f"{verdict} · {confidence}% confidence"},
+            title={"text": f"{verdict} · {confidence}% collection coverage"},
             gauge={
                 "axis": {"range": [0, 100]},
                 "bar": {"color": color},
@@ -111,6 +112,7 @@ def evidence_frame(report: dict) -> pd.DataFrame:
                 "Rule": item["rule_id"],
                 "Severity": item["severity"].upper(),
                 "Score": item["score"],
+                "Destination": defang_url(item["subject_url"]) if item.get("subject_url") else "Investigation",
                 "Confidence": f"{item['confidence']}%",
                 "Title": item["title"],
                 "Detail": item["detail"],
@@ -143,12 +145,14 @@ def render_domain_intelligence(report: dict) -> None:
         st.code("\n".join(dns["addresses"]))
         with st.expander("Optional public IP enrichment"):
             st.caption("This optional lookup sends the selected IP to the configured enrichment service. Do not use it for sensitive internal targets without approval.")
-            if st.button("Enrich first resolved IP", key="enrich_ip"):
+            if st.button("Enrich first resolved IP", key=f"enrich_{report['case_id']}"):
                 enrichment = ip_info(dns["addresses"][0])
                 if enrichment:
-                    st.json(enrichment)
+                    report["enrichment"] = enrichment
                 else:
                     st.warning("The enrichment provider returned no data.")
+            if report.get("enrichment"):
+                st.json(report["enrichment"])
     elif dns["error"]:
         st.warning(f"DNS collection failed: {dns['error']}")
 
@@ -156,7 +160,7 @@ def render_domain_intelligence(report: dict) -> None:
 def render_overview(report: dict) -> None:
     verdict = report["verdict"]
     score = report["risk_score"]
-    confidence = report["confidence"]
+    confidence = report["coverage"]["percent"]
     evidence = report["evidence"]
     severe_count = sum(item["severity"] in {"critical", "high"} for item in evidence)
     network = report["network"]
@@ -168,7 +172,8 @@ def render_overview(report: dict) -> None:
     with right:
         st.subheader("Investigation disposition")
         st.metric("Risk band", verdict)
-        st.metric("Evidence confidence", f"{confidence}% · {confidence_label(confidence)}")
+        st.metric("Collection coverage", f"{confidence}% of enabled checks")
+        st.caption("Detection confidence is uncalibrated. Risk scores are heuristic, not probabilities.")
         st.metric("High/critical signals", severe_count)
         st.metric("Evidence coverage", f"{coverage['completed_checks']}/{coverage['attempted_checks']} checks")
         if verdict in {"HIGH", "CRITICAL"}:
@@ -176,20 +181,22 @@ def render_overview(report: dict) -> None:
         elif verdict == "MEDIUM":
             st.warning("Manual review and reputation checks are required before clearing this URL.")
         else:
-            st.success("No strong local indicators were observed; this is not a guarantee of safety.")
+            st.info("A low score is not clearance. Review collection gaps and verify the destination independently.")
 
     st.divider()
     subject = report["subject"]
     first, second, third, fourth = st.columns(4)
     first.metric("Hostname", subject["domain"] or "Unknown")
-    second.metric("Final URL", network["final_url"] or subject["url"])
+    second.metric("Final destination", defang_url(network["final_url"] or subject["url"]))
     third.metric("HTTP status", network["status_code"] or "Unavailable")
     fourth.metric("Latency", f"{network['response_time_ms']} ms" if network["response_time_ms"] is not None else "Unavailable")
     if network["error"]:
         st.warning(f"Network evidence is incomplete: {network['error']}")
+    st.write("**Collection checks**")
+    st.dataframe({"Check": list(coverage["checks"]), "Status": list(coverage["checks"].values())}, hide_index=True)
     reputation = report["reputation"]
     if reputation["status"] in {"disabled", "not_configured"}:
-        st.info("Reputation lookup was not run. The current verdict uses local URL, DNS, and redirect evidence only.")
+        st.info("Reputation lookup was not run. Review collection-check states to see which evidence was available.")
     elif reputation["status"] == "error":
         st.warning(f"Reputation lookup failed: {reputation['error']}")
     elif reputation["status"] == "match":
@@ -202,7 +209,7 @@ def render_overview(report: dict) -> None:
 def render_evidence(report: dict) -> None:
     frame = evidence_frame(report)
     st.subheader("Explainable evidence ledger")
-    st.caption("Every scored signal includes a rule ID, severity, confidence, source, and collection state.")
+    st.caption("Signals identify their destination and provenance. Repeated rules contribute their maximum weight once across the redirect chain; rule confidence is an uncalibrated heuristic.")
     if frame.empty:
         st.success("No evidence objects were returned.")
         return
@@ -227,12 +234,15 @@ st.caption("Explainable URL investigation console for SOC triage and threat-inte
 with st.sidebar:
     st.header("Investigation controls")
     st.write("PhishShield combines local URL heuristics, bounded network evidence, DNS collection, and optional enrichment.")
+    static_only = st.checkbox("Static analysis only", value=False, help="Inspect URL syntax without DNS, HTTP, or reputation requests.")
+    total_timeout = st.slider("Target collection budget (seconds)", min_value=5, max_value=90, value=30)
     timeout = st.slider("Network timeout (seconds)", min_value=3, max_value=20, value=8)
     max_redirects = st.slider("Maximum redirects", min_value=1, max_value=20, value=10)
-    follow_redirects = st.checkbox("Follow redirects", value=True)
+    follow_redirects = st.checkbox("Collect HTTP and follow redirects", value=True, disabled=static_only)
     enable_reputation = st.checkbox(
         "Enable reputation lookup",
         value=False,
+        disabled=static_only,
         help="Only enable this when policy permits sending the URL to the configured provider.",
     )
     st.divider()
@@ -252,11 +262,36 @@ if submitted:
                 max_redirects=max_redirects,
                 follow_redirects=follow_redirects,
                 enable_reputation=enable_reputation,
+                static_only=static_only,
+                total_timeout=total_timeout,
             ).analyze()
     except ValueError as exc:
         st.error(str(exc))
         st.stop()
 
+    cases = st.session_state.setdefault("cases", {})
+    cases[report["case_id"]] = report
+    while len(cases) > 20:
+        del cases[next(iter(cases))]
+    st.session_state["selected_case"] = report["case_id"]
+
+cases = st.session_state.get("cases", {})
+if cases:
+    selected = st.selectbox(
+        "Session investigations", list(reversed(cases)), key="selected_case",
+        format_func=lambda case: f"{cases[case]['generated_at'][:19]} · {cases[case]['verdict']} · {defang_url(cases[case]['subject']['url'])[:90]}",
+    )
+    report = cases[selected]
+    st.caption(f"Case {report['case_id']} · Engine {report['engine_version']} · Rules {report['ruleset_version']}")
+    st.caption("History and analyst notes last for this browser session. Download cases to retain them.")
+    analyst = report.setdefault("analyst", {"disposition": "Unreviewed", "notes": ""})
+    with st.expander("Analyst disposition and notes"):
+        options = ["Unreviewed", "Investigating", "Benign", "Suspicious", "Malicious"]
+        analyst["disposition"] = st.selectbox("Disposition", options, index=options.index(analyst["disposition"]), key=f"disposition_{selected}")
+        analyst["notes"] = st.text_area("Analyst notes", value=analyst["notes"], key=f"notes_{selected}")
+        st.caption("Analyst disposition is recorded separately from the automated risk band.")
+    st.write("**Defanged IOCs — copy for your investigation**")
+    st.code("\n".join(dict.fromkeys(defang_url(item) for item in report["network"]["redirect_chain"])))
     st.divider()
     overview, evidence, redirects, infrastructure, raw = st.tabs(
         ["Disposition", "Evidence ledger", "Redirect path", "Infrastructure", "Case export"]
@@ -275,11 +310,11 @@ if submitted:
         first.metric("Network status", network["status"].title())
         second.metric("Redirect count", network["redirect_count"])
         third.metric("Final status", network["status_code"] or "Unavailable")
-        graph = redirect_graph(network["redirect_chain"])
+        graph = redirect_graph([defang_url(item) for item in network["redirect_chain"]])
         if graph:
             st.plotly_chart(graph, use_container_width=True, config={"displayModeBar": False})
         st.dataframe(
-            {"Step": list(range(1, len(network["redirect_chain"]) + 1)), "URL": network["redirect_chain"]},
+            {"Step": list(range(1, len(network["redirect_chain"]) + 1)), "URL": [defang_url(item) for item in network["redirect_chain"]]},
             hide_index=True,
             use_container_width=True,
         )
@@ -292,12 +327,15 @@ if submitted:
     with raw:
         st.subheader("Case export")
         st.write("The export includes schema version, collection time, evidence provenance, network state, DNS state, coverage, and recommendations.")
+        include_sensitive = st.checkbox("Include full URL query values and fragments in export", value=False, key=f"sensitive_{selected}")
+        export_report = report if include_sensitive else redact_report(report)
+        st.caption("Default export redacts URL query values and removes fragments. Hostnames, paths and analyst notes remain; review before sharing.")
         st.download_button(
             "Download investigation JSON",
-            data=json.dumps(report, indent=2),
-            file_name="phishshield-investigation.json",
+            data=json.dumps(export_report, indent=2),
+            file_name=f"phishshield-{report['case_id']}.json",
             mime="application/json",
             use_container_width=True,
         )
         with st.expander("View raw report"):
-            st.json(report)
+            st.json(export_report)
