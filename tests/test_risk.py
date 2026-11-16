@@ -51,3 +51,11 @@ def test_confidence_labels_are_stable():
     assert confidence_label(90) == "High"
     assert confidence_label(70) == "Moderate"
     assert confidence_label(40) == "Low"
+
+
+def test_repeated_rule_across_hops_contributes_once():
+    assert score_evidence([{'rule_id': 'IDN', 'score': 22}, {'rule_id': 'IDN', 'score': 22}])[1] == 22
+
+
+def test_negative_contributions_do_not_produce_negative_score():
+    assert score_evidence([{'score': -30}]) == ('LOW', 0)

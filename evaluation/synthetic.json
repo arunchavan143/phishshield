@@ -1,0 +1,14 @@
+[
+  {"url":"https://www.google.com","expected_review":false,"source":"known brand syntax; no live check"},
+  {"url":"https://github.com/login","expected_review":false,"source":"known brand syntax; no live check"},
+  {"url":"https://accounts.microsoft.com/login","expected_review":false,"source":"known brand syntax; no live check"},
+  {"url":"https://example.com/docs","expected_review":false,"source":"synthetic neutral URL"},
+  {"url":"https://example.org/oauth?code=example","expected_review":false,"source":"synthetic legitimate OAuth pattern"},
+  {"url":"https://bücher.de","expected_review":false,"source":"synthetic legitimate-language IDN pattern"},
+  {"url":"http://192.0.2.10/login","expected_review":true,"source":"synthetic IP-host lure"},
+  {"url":"https://paypal.example.org/login","expected_review":true,"source":"synthetic brand subdomain lure"},
+  {"url":"https://secure-google.example/verify?password=example","expected_review":true,"source":"synthetic brand lure"},
+  {"url":"http://microsoft-login.example/account/verify","expected_review":true,"source":"synthetic brand lure"},
+  {"url":"https://paypal.net","expected_review":true,"source":"synthetic exact-brand alternate-TLD pattern; not a live abuse allegation"},
+  {"url":"https://random.example/login","expected_review":true,"source":"synthetic phishing assumption with few lexical indicators; intentional blind spot"}
+]

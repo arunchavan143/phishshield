@@ -8,7 +8,7 @@ PhishShield is an explainable URL investigation console for SOC triage and threa
 
 The current architecture uses a layered evidence model rather than a single opaque heuristic. It separates local URL analysis, bounded HTTP behavior, DNS collection, optional reputation lookups, risk aggregation, and the analyst interface. Every scored observation has a stable rule ID, category, severity, score contribution, confidence, source, and collection status.
 
-The product deliberately distinguishes **risk score**, **evidence confidence**, and **coverage**. A URL may have a low local score while reputation data is unavailable, or a high score based on strong local evidence while the network lookup failed. The dashboard shows those distinctions instead of presenting a green result as a guarantee of safety.
+The product distinguishes **risk score**, **collection coverage**, and per-rule heuristic confidence annotations. These are not calibrated detection probabilities. A URL may have a low local score while reputation data is unavailable, or a high score based on strong local evidence while the network lookup failed. The dashboard shows those distinctions instead of presenting a green result as a guarantee of safety.
 
 The design follows a layered-defense approach recommended by the UK National Cyber Security Centre and emphasizes suspicious links, unexpected requests, independent verification, and reporting as described by CISA [1] [2]. NIST’s Phish Scale is a method for rating the human difficulty of detecting phishing emails, not a direct URL-malware score; PhishShield therefore does not mislabel its machine triage score as a NIST Phish Scale rating [3].
 
@@ -46,7 +46,7 @@ cd phishshield
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install -r requirements-lock.txt
 ```
 
 ## Run the console
@@ -94,7 +94,7 @@ requirements-dev.txt   Runtime plus test dependencies
 
 ## Known limitations and next production steps
 
-The current repository is a local analyst console, not a multi-user case-management service. Before production deployment, add authentication and authorization, immutable audit logs, encrypted case storage, provider rate limiting, outbound egress controls, SSRF protection for cloud-hosted deployments, a job queue for long-running collection, structured observability, CI security scanning, and a versioned policy/rule configuration store.
+The current repository is a local analyst console, not a multi-user case-management service. Before production deployment, add authentication and authorization, immutable audit logs, encrypted case storage, provider rate limiting, outbound egress controls, independent network enforcement for cloud-hosted deployments, a job queue for long-running collection, structured observability, CI security scanning, and a versioned policy/rule configuration store.
 
 A mature deployment should also add TLS-certificate inspection, passive DNS or WHOIS history from approved providers, favicon and page-structure analysis in a disposable browser sandbox, malware/reputation feeds, domain-age signals, allowlists with governance, analyst feedback, calibration against a labeled corpus, and a formal false-positive/false-negative evaluation process. Those features should be integrated as provenance-rich providers rather than hidden inside one score function.
 
@@ -104,3 +104,52 @@ A mature deployment should also add TLS-certificate inspection, passive DNS or W
 [2]: https://www.ncsc.gov.uk/guidance/phishing "UK NCSC: Phishing attacks: defending your organisation"
 [3]: https://www.nist.gov/publications/nist-phish-scale-user-guide "NIST Phish Scale User Guide"
 [4]: https://developers.google.com/safe-browsing/v4 "Google Safe Browsing API v4"
+
+## Version 3.1: investigation reliability and safer collection
+
+Python 3.11 or newer is required. CI runs on Python 3.11 and 3.12. The bundled Public Suffix List is used without a background list download, including private suffix boundaries such as hosted-site tenants.
+
+The collector now rejects non-public destinations, checks every redirect, and connects to a validated IP while preserving TLS hostname verification. Active target collection is restricted to ports 80/443. A blocked destination is a collection-policy event and does not itself prove phishing. Partial redirect observations are retained when collection fails. See [SECURITY.md](SECURITY.md) for enforcement details and deployment limits.
+
+**Static analysis only** disables DNS, target HTTP, and reputation calls. **Collect HTTP and follow redirects** controls target HTTP collection; disabling it still permits the DNS check. Optional public-IP enrichment remains an explicit separate action.
+
+### Reports, coverage, and scoring
+
+Schema 3.1 adds a case UUID, engine and ruleset versions, collection settings, per-check states, redirect-hop HTTP status and connected address, and the destination associated with each static observation. Redirect destinations receive the same static analysis as the input URL, including a destination blocked before fetching.
+
+Collection coverage reports completed **enabled** checks. Disabled checks are listed but excluded from the denominator; a requested but unconfigured reputation provider is incomplete. A 100% collection result does not establish detection accuracy. `detection_confidence` remains null. The old `confidence` field is retained only as a deprecated coverage alias.
+
+Repeated rules across redirect hops contribute their maximum weight once. Unicode and punycode are one IDN signal, preventing double counting. The 0–100 score remains a heuristic triage scale, not a probability of phishing.
+
+### Analyst workflow
+
+* Results persist across enrichment, notes, download, and sidebar interactions.
+* Session history retains the latest 20 cases; selecting a case does not rescan it.
+* Each case has analyst notes and a disposition separate from the automated risk band.
+* Defanged IOC text is ready to copy. Query values are redacted in those IOCs.
+* JSON exports redact query values and remove fragments by default. Explicitly select full URL export when needed. Paths and notes are retained, so review exports before sharing.
+* Session history is temporary. Download cases you need to keep.
+
+### Offline rule evaluation
+
+```bash
+python evaluate.py
+python evaluate.py path/to/approved-corpus.json --threshold 30
+```
+
+Each corpus row contains `url`, boolean `expected_review`, and optional `source`. The command performs static analysis only and returns a confusion matrix, precision/recall for the selected triage threshold, and case-level outcomes. The bundled examples are synthetic expectations and deliberately include a lexical blind spot. Their metrics must not be advertised as real-world detection accuracy. Production calibration needs an independently labeled, representative corpus, separate tuning/holdout sets, and false-positive/false-negative analysis.
+
+### Quality checks
+
+```bash
+python -m pytest -q
+python -m ruff check .
+python -m bandit -q -r . -x ./tests
+python -m pip_audit -r requirements.txt
+```
+
+Tests block live socket connections and DNS by default. They cover special-purpose IPs, mixed DNS answers, alternate IP notation, DNS pinning, TLS hostname preservation, target deadlines, redirect limits and partial evidence, export redaction, provider failures, and Streamlit reruns. GitHub Actions runs tests/lint/static security checks, dependency auditing, and secret scanning. Dependabot checks Python dependencies and pinned workflow actions weekly.
+
+Further deployments should add durable encrypted case storage, access control, governed policies, audited analyst feedback, and an isolated content-analysis worker. Additional reputation, domain-age, certificate, and screenshot providers need approved credentials and separate privacy controls. No license is selected by this update; the owner should choose the intended license before offering third-party reuse.
+
+`requirements-lock.txt` records the tested runtime dependency snapshot; `requirements.txt` declares compatible version ranges. Install the snapshot for reproducible setup.

@@ -72,11 +72,19 @@ def check_safe_browsing(url: str, timeout: float = 8.0) -> ReputationResult:
             f"{SAFE_BROWSING_ENDPOINT}?key={api_key}",
             json=payload,
             timeout=timeout,
+            allow_redirects=False,
             headers={"User-Agent": "PhishShield/3.0 security research"},
         )
         response.raise_for_status()
         body = response.json()
+        if not isinstance(body, dict):
+            raise ValueError("Expected an object")
         matches = body.get("matches", [])
+        if not isinstance(matches, list) or any(
+            not isinstance(match, dict) or match.get("threatType") not in THREAT_TYPES
+            for match in matches
+        ):
+            raise ValueError("Invalid threat matches")
         if not matches:
             return ReputationResult(
                 status="clean",
@@ -97,6 +105,7 @@ def check_safe_browsing(url: str, timeout: float = 8.0) -> ReputationResult:
                 "confidence": 99,
                 "source": "Google Safe Browsing",
                 "status": "observed",
+                "subject_url": url,
             },
         )
         return ReputationResult(
@@ -112,15 +121,15 @@ def check_safe_browsing(url: str, timeout: float = 8.0) -> ReputationResult:
             status="error",
             provider="Google Safe Browsing",
             checked_at=_timestamp(),
-            error=str(exc),
+            error=f"Reputation request failed ({type(exc).__name__}).",
             detail="The configured reputation provider could not be reached.",
         )
-    except ValueError as exc:
+    except ValueError:
         return ReputationResult(
             status="error",
             provider="Google Safe Browsing",
             checked_at=_timestamp(),
-            error=f"Invalid provider response: {exc}",
+            error="Invalid provider JSON or threat-match schema.",
             detail="The configured reputation provider returned invalid JSON.",
         )
 
